@@ -1,0 +1,13 @@
+#!/bin/bash
+OUT=/var/www/durep/`hostname -s`/index.html
+echo "<html>" > $OUT
+echo "<center>" >>$OUT
+echo "<h1>" >>$OUT
+echo "<b>Users</b><br>" >>$OUT
+#for user in `ls -l | awk '/^d/`
+for user in `ls  -l /nobackup | awk /^d/ | awk '{print $9}'`
+do
+echo "<a href="$user/0.html">$user</a><br>" >>$OUT
+done
+echo "</center>" >>$OUT
+echo "</html>" >>$OUT
