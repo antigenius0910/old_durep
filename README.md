@@ -1,5 +1,5 @@
 # old_durep
-very old durep automation for storage check 
+very old durep crontab automation for daily storage check 
 
 old and slow but still works like a champ
 
