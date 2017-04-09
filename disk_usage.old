@@ -1,0 +1,19 @@
+#!/bin/bash
+set -x
+LOG='/tmp/disk.log';
+SRCDIR='/nobackup'
+HOST=`hostname -s`
+DUREPDIR="/var/www/durep/$HOST"
+/bin/date > $LOG
+for i in `cat /root/bin/nobackuplist`
+#for i in `ls  -l /nobackup | awk /^d/ | awk '{print $8}'`
+do
+        if [ ! -d $DUREPDIR/$i ]
+                then
+                mkdir -p $DUREPDIR/$i
+        fi
+        echo "$user ended at `date` " >> $LOG
+        /usr/bin/durep -q -x -w $DUREPDIR/$i $SRCDIR/$i
+done
+/root/bin/mkhtml > $DUREPDIR/index.html
+mail -s "$HOST $SRCDIR daily Disk Usage" USER@COMPANY.COM < $LOG
