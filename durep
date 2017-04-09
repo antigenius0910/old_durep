@@ -1,0 +1,878 @@
+#!/usr/bin/perl
+#############################################################################
+# durep - Disk Usage Report Generator                                       #
+#                                                                           #
+# Copyright (C) 1999-2003 Damian Kramer (psiren@hibernaculum.net)           #
+#                                                                           #
+# You may distribute this program under the terms of the Artistic License.  #
+#                                                                           #
+# This program is distributed in the hope that it will be useful, but       #
+# WITHOUT ANY WARRANTY; without even the implied warranty of                #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the             #
+# Artistic License for more details.                                        #
+#############################################################################
+
+
+use Getopt::Long;
+use File::Basename;
+use POSIX;
+use I18N::Langinfo qw(langinfo CODESET);
+use Cwd qw(cwd);
+
+use strict;
+
+use vars qw(@doodad %options %inodes %user_inc_uids @user_inc_names);
+use vars qw(@user_exc_names %user_exc_list $depth_count);
+use vars qw($version $idcount $filesystem_id $root_node $root_dir);
+
+use vars qw($opt_help $opt_version $opt_textdepth $opt_webdepth $opt_hidesize);
+use vars qw($opt_collapsepath $opt_expandpath $opt_nosort $opt_quiet $opt_savefile);
+use vars qw($opt_loadfile $opt_webdir $opt_files $opt_onefilesystem $opt_accessed);
+use vars qw($opt_modified $opt_users $opt_xusers $opt_excludepath);
+
+
+$version = "0.8.1";     # Version number perhaps?
+
+$idcount = 0;           # Current node id number
+$depth_count = -1;      # Current depth in dir tree
+%inodes = ();           # A record of file with a hard link count > 1
+%user_inc_uids = ();    # uids to include
+@user_inc_names = ();   # user names to include
+%user_exc_list = ();    # uids to exclude
+@user_exc_names = ();   # user names to exclude
+
+
+# Mmmmm.. options...
+%options = ("help"                => \$opt_help,
+	    "version"             => \$opt_version,
+	    "td|text-depth=i"     => \$opt_textdepth,
+	    "wd|web-depth=i"      => \$opt_webdepth,
+	    "hs|hide-size=s"      => \$opt_hidesize,
+	    "cp|collapse-path=s"  => \$opt_collapsepath,
+	    "xp|expand-path=s"    => \$opt_expandpath,
+	    "ns|nosort"           => \$opt_nosort,
+	    "q|quiet"             => \$opt_quiet,
+	    "w|webdir=s"          => \$opt_webdir,
+	    "sf|save-file=s"      => \$opt_savefile,
+	    "lf|load-file=s"      => \$opt_loadfile,
+	    "f|files"             => \$opt_files,
+	    "x|one-file-system"   => \$opt_onefilesystem,
+	    "a|accessed=s"        => \$opt_accessed,
+	    "m|modified=s"        => \$opt_modified,
+	    "u|users=s"           => \$opt_users,
+	    "xu|xusers=s"         => \$opt_xusers,
+	    "ep|exclude-path=s"   => \$opt_excludepath
+	   );
+
+
+# Righty dokey me ol' mucker. Lets get cracking shall we?
+&usage unless (GetOptions(%options));
+
+&usage if(defined $opt_help);
+
+if(defined $opt_version) {
+  print "durep version $version\n";
+  exit 0;
+}
+
+# Prepare any options we need to
+$opt_modified = process_time_options($opt_modified) if(defined $opt_modified);
+$opt_accessed = process_time_options($opt_accessed) if(defined $opt_accessed);
+process_users_option($opt_users, 1) if(defined $opt_users);
+process_users_option($opt_xusers, 0) if(defined $opt_xusers);
+$opt_hidesize = process_size_option($opt_hidesize) if(defined $opt_hidesize);
+
+# Doh! Ya cannae do that captain.
+if(defined $opt_textdepth) {
+  do_abort("Depth must be greater than 0.") unless ($opt_textdepth > 0);
+}
+
+if(defined $opt_webdepth) {
+  do_abort("Depth must be greater than 0.") unless ($opt_webdepth > 0);
+}
+
+# Doh again.
+if(defined $opt_webdir) {
+  unless (-d $opt_webdir && -x $opt_webdir && -w $opt_webdir) {
+    do_abort("Unable to access directory `$opt_webdir'.");
+  }
+  $opt_webdir .= "/" unless($opt_webdir =~ m|./$|);
+}
+
+# Geez. Did you read the help? ;)
+if(defined $opt_quiet && !defined $opt_webdir && !defined $opt_savefile) {
+  do_abort("You must specify a web directory or save file if you use --quiet.");
+}
+
+# Obtain the data, by fair means or foul
+if(defined $opt_loadfile) {
+  my $temp;
+  my @l = ();
+
+  open(LF, $opt_loadfile);
+  $root_node = @{load_file()}[0];
+  close(LF);
+
+  $temp = $root_node->{NAME};
+  $temp .= "/" unless $temp =~ m|/$|;
+
+  if(@ARGV) {
+    $root_dir = shift @ARGV;
+    $root_dir = substr($root_dir, 1) if $root_dir =~ m|^/|;
+    @l = split("/", $root_dir);
+
+    # If we had a dir specified on the cmd line then try and find it in here
+  ERM: while(@l) {
+      my $scan;
+      my $dir = shift @l;
+      foreach $scan (@{$root_node->{CHILDREN}}) {
+	if($scan->{NAME} eq $dir) {
+	  $temp .= "$dir/";
+	  $root_node = $scan;
+	  delete $root_node->{PARENT}; 
+	  next ERM;
+	}
+      }
+      do_abort("The save file does not contain the directory `$root_dir'.");
+    }
+    chop $temp;
+    $root_node->{NAME} = $temp;
+  }
+  $root_dir = $temp;
+}
+else {
+  # No dir specified, so use the current one, i.e. du behaviour.
+  push @ARGV, "." unless @ARGV;
+  
+  $root_dir = shift @ARGV;
+  chop $root_dir if $root_dir =~ m|./$|;  # Remove trailing /
+  
+  do_abort("`$root_dir' not a valid directory.") unless -d $root_dir;
+  
+  # Get the absolute pathname rather than relative pathname
+  $_ = cwd();
+  chdir($root_dir);
+  $root_dir = cwd();
+  chdir($_);
+  
+  # Find the filesystem id if we need it.
+  ($filesystem_id) = stat $root_dir if defined $opt_onefilesystem;
+  
+  if(defined $opt_files) {
+    $root_node = scan_files($root_dir);
+  }
+  else {
+    $root_node = scan_dirs($root_dir);
+  }
+}
+
+# Print the results to stdout unless --quiet was defined.
+unless(defined $opt_quiet) {
+  if($root_node->{CHILDREN}) {
+    my @l = show_options();
+    print join("\n", @l) . "\n\n" if @l;
+    printf("[ %s%s  %s ]\n", $root_dir, ($root_dir =~ m|/$|) ? "" : "/", create_file_size($root_node->{SIZE}, 1));
+    print_report($root_node) if $root_node->{SIZE};
+  }
+  else {
+    print "No matching entries.\n";
+  }
+}
+
+# Write out the web pages if a dir was specified
+make_web_pages($root_node) if defined $opt_webdir;
+
+# Save the tree to a file
+if(defined $opt_savefile) {
+  open(SF, ">$opt_savefile") or do_abort("Unable to open $opt_savefile for writing.");
+  save_file($root_node);
+  close(SF);
+}
+
+
+### Loads a previously saved durep tree from a file
+sub load_file {
+  my @l;
+
+  while(<LF>) {
+    my %node;
+    my $fpos;
+
+    chomp($_);
+
+    if($_ eq ">") {
+      $l[$#l]->{CHILDREN} = load_file($l[$#l]);
+      next;
+    }
+    last if $_ eq "<";
+
+    push @l, \%node;
+    
+    $node{NAME} = $_;
+    chomp($node{SIZE} = <LF>);
+    chomp($_ = <LF>);
+    $node{COUNT} = $_ if $_ ne '';
+    chomp($_ = <LF>);
+    $node{PATH} = $_ if $_ ne '';
+
+    $node{PARENT} = $_[0] if defined $_[0];
+  }
+  return \@l;
+}
+
+
+### Saves the current tree to a file
+sub save_file {
+  my ($loop, $children);
+
+  print SF "$_[0]->{NAME}\n";
+  print SF "$_[0]->{SIZE}\n"; 
+  print SF "$_[0]->{COUNT}" if defined $_[0]->{COUNT};
+  print SF "\n";
+  print SF "$_[0]->{PATH}" if defined $_[0]->{PATH};
+  print SF "\n";
+
+  if(defined $_[0]->{CHILDREN}) {
+    $children = $_[0]->{CHILDREN};
+    print SF ">\n";
+    for $loop (@$children) {
+      save_file($loop);
+    }
+    print SF "<\n";
+  }
+}
+
+
+### Print the report to stdout
+sub print_report {
+  my ($loop, $children);
+
+  $depth_count++;
+
+  $children = $_[0]->{CHILDREN};
+  for $loop (@$children) {
+    next if(defined $opt_hidesize && $loop->{SIZE} <= $opt_hidesize);
+
+    print_entry($loop, $_[0]->{SIZE}, 1);
+    if(defined $loop->{PATH}) {
+      print "/" unless $loop->{NAME} =~ m|/$|;
+    }
+    print "\n";
+
+    unless(defined $loop->{PATH} && collapse_dir($loop->{PATH})) {
+      print_report($loop);
+    }
+  }
+
+  $depth_count--;
+}
+
+
+### Print an entry to stdout. Called form print_report.
+sub print_entry {
+  my ($entry, $total, $show_count) = @_;
+  my $numofchars;
+  my $percent = $total == 0 ? 0 : ($entry->{SIZE}/$total)*100;
+  print "     " x $depth_count;
+  print(create_file_size($entry->{SIZE}), " ");
+  $numofchars = int ((30 / 100) * $percent);
+  printf("[%s%s] ", "%" x $numofchars, " " x (30-$numofchars));
+  printf("%2d ", $entry->{COUNT}) if($show_count && defined $entry->{COUNT});
+  printf("%6.2f%% ", $percent);
+  print($entry->{NAME});
+}
+
+
+### Hmmm. Wonder what this one does? Answers on a postcard...
+sub make_web_pages {
+  my $loop;
+  my $count;
+  my $percent;
+  my $path = "";
+
+  local *FILE;
+
+  my $this = $_[0];
+  my $file = "$opt_webdir$idcount.html";
+
+  $depth_count++;
+
+  open(FILE, ">$file") or do_abort("Unable to open `$file' for writing.");
+  print FILE web_header($this->{PATH});
+  
+  # Create the links for the preceding dirs
+  foreach $loop (@doodad) {
+    $path .= sprintf("<a href='%d.html'>%s</a>%s", @$loop[1], @$loop[0],
+		     (@$loop[0] =~ m|/$|) ? "" : "/");
+  }
+  $path .= $this->{NAME};
+  $path .= "/" unless $this->{NAME} =~ m|/$|;
+
+  # And add ourselves to the list
+  push @doodad, [ ($this->{NAME}, $idcount++) ];
+
+  print FILE "<table bgcolor='#CCCCCC' width=100% cellpadding=2 cellspacing=0 border=0><tr><td>";
+  print FILE "&nbsp;<b>$path</b></td><td align=right><b>Total Usage ",
+  create_file_size($this->{SIZE}, 1);
+  print FILE "</b>&nbsp;</td></tr></table><hr noshade size=1><br>\n";
+  print FILE "<table cellpadding=0 cellspacing=3 border=0>\n";
+  print FILE "<tr><th colspan=2 align=left>Size</th><th colspan=3 align=left>Percentage Used</th>";
+  print FILE "<th align=left>Count</th><th></th>";
+  print FILE "<th align=left>Directory</th></tr>\n";
+
+  $count = 0;
+
+  if(defined $this->{CHILDREN}) {
+    for $loop (@{$this->{CHILDREN}}) {
+      next if(defined $opt_hidesize && $loop->{SIZE} <= $opt_hidesize);
+      
+      $count++;
+
+      $percent = $loop->{PARENT}->{SIZE} ? ($loop->{SIZE}/$loop->{PARENT}->{SIZE}*100) : 0;
+      
+      print FILE "<tr><td align=right>", create_file_size($loop->{SIZE}, 1), "</td>";
+      
+      print FILE "<td width=10>&nbsp;</td><td width=200><table cellpadding=0 cellspacing=0 border=0><tr>";
+      
+      print FILE web_bar_graph(int($percent*2+0.5));
+      
+      print FILE "</td></tr></table></td>";
+      
+      printf FILE "<td align=right>%4.2f%%</td><td width=10>&nbsp;</td>", $percent;
+
+      print FILE "<td align=right>";
+      if(defined $loop->{COUNT}) {
+	print FILE $loop->{COUNT};
+      }
+      else {
+	print FILE "-";
+      }
+      print FILE "</td><td width=10>&nbsp;</td>";
+      
+      print FILE "<td>";
+      if(defined $loop->{CHILDREN}) {
+	if(web_collapse_dir($loop->{PATH})) {
+	  print FILE "<font color=green><b>$loop->{NAME}</b></font>";
+	  print FILE "/" if defined $loop->{PATH};
+	}
+	else {
+	  print FILE "<b><a href='$idcount.html'>";
+	  print FILE $loop->{NAME};
+	  print FILE "/" if defined $loop->{PATH};
+	  print FILE "</a></b>";
+	  make_web_pages($loop);
+	}
+      }
+      else {
+	print FILE $loop->{NAME};
+	print FILE "/" if defined $loop->{PATH};
+      }
+      print FILE "</td></tr>\n";
+    }
+  }
+
+  unless($count) {
+    print FILE "<tr><td>No matching entries.</td></tr>";
+  }
+
+  print FILE "</table>\n";
+  print FILE web_footer();
+  close(FILE);
+
+  # We'd better try and make these files readable via the web, yes?
+  chmod 0644, $file;
+
+  $depth_count--;
+  pop @doodad;
+}
+
+
+### All this does is create an HTML table bar graph type thingy.
+sub web_bar_graph {
+  return "<td bgcolor='#CCCCCC' width=200 height=15><ilayer></ilayer></td>" unless $_[0];
+  return "<td bgcolor='blue' width=200 height=15><ilayer></ilayer></td>" if($_[0] == 200);
+  return "<td bgcolor='blue' width=" . $_[0] . " height=15><ilayer></ilayer></td>" .
+    "<td bgcolor='#CCCCCC' width=" . (200-$_[0]) . "><ilayer></ilayer></td>";
+}
+
+
+### Generate the header for the web page.
+sub web_header {
+  my @l;
+  my $ret = "<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=".
+  langinfo(CODESET)."\"><title>Disk Usage Report [$_[0]]</title></head>";
+  $ret .= "<body bgcolor='#FFFFFF' text='#000000' link='#0000FF' vlink='#0000AA'>";
+  $ret .= "<center><h1>Disk Usage Report</h1></center>";
+
+  @l = show_options();
+  $ret .= (join("<br>\n", @l) . "<br><br>") if @l;
+
+  return $ret;
+}
+
+
+### You guessed it. Footer for the web page. You're so smart.
+sub web_footer {
+ my $ret = "<br><hr noshade size=1>\n";
+ $ret .= "<table bgcolor='#CCCCCC' width=100% cellpadding=1 cellspacing=0 border=0><tr><td align=left>";
+ $ret .= "&nbsp;<small>" . POSIX::strftime("%c", localtime(time)) . "</small></td><td align=right>";
+ $ret .= "<small>Generated by <a href='http://www.hibernaculum.net/'><i>durep</i></a> v. $version</small>&nbsp;</td></tr></table>";
+ $ret .= "</body></html>\n";
+ return $ret;
+}
+
+
+### Show all the options that we've used that influence the final output.
+sub show_options {
+  my @l;
+  
+  push @l, "Showing only entries above " . create_file_size($opt_hidesize, 1) . "." if defined $opt_hidesize;
+  push @l, "Collapsing paths matching `" . $opt_collapsepath . "'." if defined $opt_collapsepath;
+  push @l, "Restricting scan to one filesystem." if defined $opt_onefilesystem;
+  push @l, "Scanning only files." if defined $opt_files;
+  push @l, "Including only files accessed since " . POSIX::strftime("%c", localtime($opt_accessed)) . "."
+    if defined $opt_accessed;
+  push @l, "Including only files modified since " . POSIX::strftime("%c", localtime($opt_modified)) . "."
+    if defined $opt_modified;
+  push @l, "Including only files owned by `" . (join ", ", @user_inc_names) . "'." if defined $opt_users;
+  push @l, "Excluding files owned by `" . (join ", ", @user_exc_names) . "'." if defined $opt_xusers;
+  push @l, "Excluding paths matching `" . $opt_excludepath . "'." if defined $opt_excludepath;
+  return @l;
+}
+
+
+### Oooh, look mummy. A recursive subroutine. Yum. This one scans the
+### dirs. Whaddya mean you knew that? Smart arse.
+sub scan_dirs {
+  my ($dir, $parent) = @_;
+  my $temp;
+  my $child;
+  my @s;
+  my @l;
+  my %files;
+  my %node;
+
+  $depth_count++;
+
+  if(defined $parent) {
+    $node{NAME} = basename($dir);
+    $node{PARENT} = $parent;
+  }
+  else {
+    $node{NAME} = $dir;
+  }    
+  $node{SIZE} = 0;
+  $node{COUNT} = 0;
+  $node{PATH} = $dir;
+
+  $files{SIZE} = 0;
+  $files{COUNT} = 0;
+  $files{NAME} = "[FILES]";
+  $files{PARENT} = \%node;
+  
+  opendir(DIR, $dir);
+  
+  foreach(readdir(DIR)) {
+    $child = $dir eq "/" ? "/$_" : "$dir/$_";
+
+    @s = lstat $child;
+
+    # Deal with '.' and '..'
+    if(/^\.{1,2}$/) {
+      $temp += $s[7];
+      next;
+    }
+
+    if(-d $child && ! -l $child) {
+      if(! -x $child) {
+	print STDERR "Warning: Unable to read directory `$child'. Skipping.\n";
+	next;
+      }
+      next unless include_dir($dir, \@s);
+      my $temp = scan_dirs($child, \%node);
+      
+      next unless $temp->{SIZE};
+
+      $node{SIZE} += $temp->{SIZE};
+      push @l, $temp;
+      $node{COUNT}++;
+      next;
+    }
+    
+    # If hard links > 1 then ensure we don't count this file more than once
+    if($s[3] > 1) {
+      next if($inodes{$s[0]}{$s[1]});
+      $inodes{$s[0]}{$s[1]} = 1;
+    }
+    $files{SIZE} += ($s[12] * 512) if(include_file($_, \@s));
+    $files{COUNT}++;
+  }
+
+  closedir(DIR);
+
+  $node{SIZE} += $files{SIZE};
+
+  # Don't create an entry if all we have is files
+  if(@l) {
+    if($files{COUNT}) {
+      push(@l, \%files);
+    }
+    # Sort the entries unless told otherwise
+    @l = reverse(sort sort_results @l) unless defined $opt_nosort;
+
+    $node{CHILDREN} = [ @l ];
+  }
+
+  $node{SIZE} += $temp if($node{SIZE});
+
+  $depth_count--;
+  return \%node;
+}
+
+
+### And this one just scans for files. Am I being obvious here?
+sub scan_files {
+  my $dir = $_[0];
+  my $usage = 0;
+  my @s;
+  my @l;
+  my $child;
+
+  my %node;
+
+  $node{NAME} = basename($dir) . "/";
+  $node{COUNT} = 0;
+  $node{SIZE} = 0;
+  $node{PATH} = $dir;
+
+  opendir(DIR, $dir);
+  
+  foreach(readdir(DIR)) {
+    my %file;
+    
+    $child = $dir eq "/" ? "/$_" : "$dir/$_";
+
+    # Skip dirs
+    next if(/^\.{1,2}$/ || -d $child);
+    
+    @s = lstat $child;
+    # If hard links > 1 then ensure we don't count this file more than once
+    if($s[3] > 1) {
+      next if($inodes{$s[0]}{$s[1]});
+      $inodes{$s[0]}{$s[1]} = 1;
+    }
+
+    if(include_file($_, \@s)) {
+      $file{NAME} = $_;
+      $file{SIZE} = $s[12] * 512;
+      $file{PARENT} = \%node;
+      $node{COUNT}++;
+      $node{SIZE} += $file{SIZE};
+      
+      push @l, \%file;
+    }
+  }
+
+  if(@l) {
+    # Sort the entries unless told otherwise
+    @l = reverse(sort sort_results @l) unless defined $opt_nosort;
+    $node{CHILDREN} = [ @l ];
+  }
+
+  return \%node;
+}
+
+
+### This checks to see if a given dir should be collapsed for web
+### output. Even if it has sub dirs we may not want to see them.
+sub web_collapse_dir {
+  my ($path) = @_;
+  my $rule_used = 0;
+  my $add = 0;
+
+  return 0 unless (defined $opt_collapsepath || defined $opt_expandpath || defined $opt_webdepth);
+
+  if(defined $opt_collapsepath) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if $path =~ m/$opt_collapsepath/;
+  }
+  return 1 if $add && $rule_used;
+
+  if(defined $opt_expandpath) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 unless $path =~ m/$opt_expandpath/;
+  }
+  return 1 if $add && $rule_used;
+
+  if(defined $opt_webdepth) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if $depth_count == ($opt_webdepth-1);
+  }
+  return 1 if $add && $rule_used;
+
+  return 0;
+}
+
+
+### This checks to see if a given dir should be collapsed for text
+### output.
+sub collapse_dir {
+  my ($path) = @_;
+  my $rule_used = 0;
+  my $add = 0;
+
+  return 0 unless (defined $opt_collapsepath || defined $opt_expandpath || defined $opt_textdepth);
+
+  if(defined $opt_collapsepath) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if $path =~ m/$opt_collapsepath/;
+  }
+  return 1 if $add && $rule_used;
+
+  if(defined $opt_expandpath) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 unless $path =~ m/$opt_expandpath/;
+  }
+  return 1 if $add && $rule_used;
+
+  if(defined $opt_textdepth) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if $depth_count == ($opt_textdepth-1);
+  }
+  return 1 if $add && $rule_used;
+
+  return 0;
+}
+
+
+### This checks to see if a given directory should be included in the
+### scan. Certain options will stop some dirs being scanned.
+sub include_dir {
+  my ($path, $stat) = @_;
+  my $rule_used = 0;
+  my $add = 0;
+
+  return 1 unless (defined $opt_excludepath || defined $opt_onefilesystem);
+
+  if(defined $opt_onefilesystem) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if @$stat[0] == $filesystem_id;
+  }
+  return 0 if !$add && $rule_used;
+
+  if(defined $opt_excludepath) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 unless $path =~ m/$opt_excludepath/;
+  }
+  return 0 if !$add && $rule_used;
+
+  return 1;
+}
+
+
+### And this one checks if a file should be included.
+sub include_file {
+  my ($name, $stat) = @_;
+  my $rule_used = 0;
+  my $add = 0;
+
+  return 1 unless (defined $opt_accessed || defined $opt_modified || defined $opt_users);
+
+  if(defined $opt_accessed) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if(@$stat[8] > $opt_accessed);
+  }
+  return 0 if !$add && $rule_used;
+
+  if(defined $opt_modified) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if(@$stat[9] > $opt_modified);
+  }
+  return 0 if !$add && $rule_used;
+
+  if(defined $opt_users) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 if defined $user_inc_uids{@$stat[4]};
+  }
+  return 0 if !$add && $rule_used;
+
+  if(defined $opt_xusers) {
+    $rule_used = 1;
+    $add = 0;
+    $add = 1 unless defined $user_exc_list{@$stat[4]};
+  }
+  return 0 if !$add && $rule_used;
+
+  return 1;
+}
+
+
+### This takes the argument to --accessed or --modified and returns
+### the time that it specifies.
+sub process_time_options {
+  my ($size, $temp);
+
+  if($_[0] =~ m/[wWdDhHmM]$/) {
+    ($size, $temp) = $_[0] =~ m/^(.+)([wWdDhHmM])$/;
+  }
+  else {
+    $size = $_[0];
+  }
+
+  unless (defined $size && $size =~ m/^\d+$/) {
+    do_abort("Malformed argument: $_[0]");
+  }
+
+  if(defined $temp) {
+    $size *= 60 if $temp =~ m/^[mM]/;
+    $size *= 3600 if $temp =~ m/^[hH]/;
+    $size *= 86400 if $temp =~ m/^[dD]/;
+    $size *= 604800 if $temp =~ m/^[wW]/;
+  }
+  else {
+    $size *= 86400;
+  }
+  return time - $size;
+}
+
+
+### This takes the size arguments and processes them. It returns the
+### size in bytes.
+sub process_size_option {
+  my ($size, $temp);
+
+  if($_[0] =~ m/[bBkKmMgG]$/) {
+    ($size, $temp) = $_[0] =~ m/^(.+)([bBkKmMgG])$/;
+  }
+  else {
+    $size = $_[0];
+  }
+
+  unless (defined $size && ($size =~ m/^\d+$/ || $size =~ m/^\d+\.\d+$/)) {
+    do_abort("Malformed argument: $_[0]");
+  }
+
+  if(defined $temp) {
+    if($temp =~ m/^[kK]/) {
+      return $size * 1024;
+    }
+    elsif ($temp =~ m/^[mM]/) {
+      return $size * 1048576;
+    }
+    elsif ($temp =~ m/^[mM]/) {
+      return $size * 1048576 * 1024;
+    }
+    return $size;
+  }
+}
+
+
+### Process any user lists
+sub process_users_option {
+  my @users = split ",", $_[0];
+  my $inc = $_[1];
+
+  while(<@users>) {
+    my ($name, $passwd, $uid) = getpwnam $_;
+    if(! defined $uid) {
+      print STDERR "Warning: user `$_' does not exist. Skipping.\n";
+      next;
+    }
+    if($inc) {
+      $user_inc_uids{$uid} = 1;
+      push @user_inc_names, $name;
+    }
+    else {
+      $user_exc_list{$uid} = 1;
+      push @user_exc_names, $name;
+    }
+  }
+}
+
+
+# Generates a human readable file size string
+sub create_file_size {
+  my ($val, $nofill) = @_;
+  my $dtype = "b";
+
+  if($val >= 1024) {
+    $val /= 1024;
+    $dtype = "K";
+  }
+  if($val >= 1024) {
+    $val /= 1024;
+    $dtype = "M";
+  }
+  if($val >= 1024) {
+    $val /= 1024;
+    $dtype = "G";
+  }
+  if($dtype eq "b") {
+    return sprintf("%d%s", $val, $dtype) if defined $nofill;
+    return sprintf("%6d%s", $val, $dtype);
+  }
+  else {
+    return sprintf("%.1f%s", $val, $dtype) if defined $nofill;
+    return sprintf("%6.1f%s", $val, $dtype);
+  }
+}
+
+
+### Used to sort the results in size
+sub sort_results {
+  return $a->{SIZE} <=> $b->{SIZE};
+}
+
+
+### End program with error message
+sub do_abort {
+  print STDERR "Error: $_[0]\n";
+  exit 1;
+}
+
+
+### Usage message. Tough one that.
+sub usage {
+print <<EOF;
+Usage: durep [OPTION(S)] [DIRECTORY]
+  --help                        this help
+  --version                     show version number
+
+Ouput Options:
+  -td, --text-depth=N           limit text report on directories to depth N
+  -wd, --web-depth=N            limit web report on directories to depth N
+  -hs, --hide-size=N[bkmg]      do not display entries using N Bytes/Kb/Mb/Gb
+                                or less (default Bytes)
+  -cp, --collapse-path=<regexp> hide entries below paths that match regexp
+  -xp, --expand-path=<regexp>   only show entries below paths that match regexp
+  -ns, --nosort                 do not sort results by size
+   -q, --quiet                  do not produce text output
+   -w, --webdir=<dir>           specifiy the directory for html files output
+                                (this must exist)
+  -sf, --save-file=<file>       save the results of the scan into this file
+  -lf, --load-file=<file>       load the results of a scan from this file
+
+Inclusion Options:
+   -f, --files                  do not descend into subdirs, only report files
+   -x, --one-file-system        do not traverse file systems
+   -a, --accessed=N[wdhm]       only include files accessed in the last
+                                N wks/days/hrs/mins (default days)
+   -m, --modified=N[wdhm]       only include files modified in the last
+                                N wks/days/hrs/mins (default days)
+   -u, --users=<userlist>       only include files owned by specified users
+  -xu, --xusers=<userlist>      exclude files owned by specified users
+  -ep, --exclude-path=<regexp>  ignore paths that match regexp
+EOF
+  exit 0;
+}
